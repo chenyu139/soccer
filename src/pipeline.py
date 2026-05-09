@@ -5,7 +5,11 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
+import cv2
+import numpy as np
+
 from .detector import DetectorProtocol, YoloDetector
+from .frame_buffer import AnnotatedFrameBuffer
 from .game_engine import GameEngine
 from .postprocess import TrackPostProcessor
 from .projector import PITCH_LENGTH_M, PITCH_WIDTH_M, LinearProjector, ProjectorProtocol
@@ -14,6 +18,53 @@ from .tracker import ByteTrackAdapter, TrackerProtocol
 from .video_reader import BufferedVideoReader, DecodeConfig
 
 SCHEMA_VERSION = "1.5"
+
+# BGR colors for server-side annotation drawing
+_COLOR_TEAM_A = (77, 93, 255)       # "#ff5d4d" RGB
+_COLOR_TEAM_B = (255, 161, 73)      # "#49a1ff" RGB
+_COLOR_DETECTION = (87, 224, 255)   # "rgba(255, 224, 87, 0.9)" RGB
+_COLOR_LABEL_BG = (15, 18, 20)      # "rgba(15, 18, 20, 0.78)"
+_COLOR_LABEL_TEXT = (255, 255, 255)
+
+
+def _dashed_line(
+    img: np.ndarray,
+    pt1: tuple[int, int],
+    pt2: tuple[int, int],
+    color: tuple[int, int, int],
+    thickness: int = 1,
+    dash_length: int = 6,
+    gap_length: int = 4,
+) -> None:
+    dx = pt2[0] - pt1[0]
+    dy = pt2[1] - pt1[1]
+    length = max(abs(dx), abs(dy), 1)
+    pos = 0
+    while pos < length:
+        sx = pt1[0] + int(dx * pos / length)
+        sy = pt1[1] + int(dy * pos / length)
+        end = min(pos + dash_length, length)
+        ex = pt1[0] + int(dx * end / length)
+        ey = pt1[1] + int(dy * end / length)
+        cv2.line(img, (sx, sy), (ex, ey), color, thickness)
+        pos += dash_length + gap_length
+
+
+def _dashed_rectangle(
+    img: np.ndarray,
+    pt1: tuple[int, int],
+    pt2: tuple[int, int],
+    color: tuple[int, int, int],
+    thickness: int = 1,
+    dash_length: int = 6,
+    gap_length: int = 4,
+) -> None:
+    x1, y1 = pt1
+    x2, y2 = pt2
+    _dashed_line(img, (x1, y1), (x2, y1), color, thickness, dash_length, gap_length)
+    _dashed_line(img, (x2, y1), (x2, y2), color, thickness, dash_length, gap_length)
+    _dashed_line(img, (x2, y2), (x1, y2), color, thickness, dash_length, gap_length)
+    _dashed_line(img, (x1, y2), (x1, y1), color, thickness, dash_length, gap_length)
 
 
 def _fallback_bbox(kind: str, x_px: float, y_px: float) -> tuple[float, float, float, float]:
@@ -62,6 +113,7 @@ class StreamProcessor:
         game_engine: GameEngine | None = None,
         prefer_latest_frame: bool = True,
         continuity_window_ms: int = 1200,
+        annotated_frame_buffer: AnnotatedFrameBuffer | None = None,
     ) -> None:
         self.source_arg = source
         self.target_fps = target_fps
@@ -85,11 +137,56 @@ class StreamProcessor:
         self._last_ball_entity: dict[str, Any] | None = None
         self._last_ball_track: dict[str, Any] | None = None
         self._last_projector_shape: tuple[int, int] | None = None
+        self._annotated_frame_buffer = annotated_frame_buffer
 
     def stop(self) -> None:
         """Request the processing loop to stop."""
 
         self.running = False
+
+    def _draw_annotations(
+        self,
+        frame: np.ndarray,
+        detections: list[Any],
+        tracks: list[Any],
+        track_bboxes: list[tuple[float, float, float, float]],
+    ) -> None:
+        for det in detections:
+            x, y, w, h = int(det.x), int(det.y), int(det.w), int(det.h)
+            _dashed_rectangle(frame, (x, y), (x + w, y + h), _COLOR_DETECTION)
+
+        for track, (bx, by, bw, bh) in zip(tracks, track_bboxes):
+            x, y, w, h = int(bx), int(by), int(max(1, bw)), int(max(1, bh))
+            team = getattr(track, "team", "unknown")
+            color = _COLOR_TEAM_A if team == "A" else _COLOR_TEAM_B if team == "B" else (245, 247, 250)
+
+            cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
+
+            label = f"{track.track_id} {track.kind} {int(track.confidence * 100)}%"
+            font_scale = 0.45
+            thickness = 1
+            (text_w, text_h), _baseline = cv2.getTextSize(
+                label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness,
+            )
+            text_x = max(0, x)
+            text_y = max(text_h + 2, y - 4)
+            cv2.rectangle(
+                frame,
+                (text_x, text_y - text_h - 4),
+                (text_x + text_w + 8, text_y + 2),
+                _COLOR_LABEL_BG,
+                cv2.FILLED,
+            )
+            cv2.putText(
+                frame,
+                label,
+                (text_x + 4, text_y - 2),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                font_scale,
+                _COLOR_LABEL_TEXT,
+                thickness,
+                cv2.LINE_AA,
+            )
 
     def _serialize_detection(self, detection: Any) -> dict[str, Any]:
         return {
@@ -378,6 +475,17 @@ class StreamProcessor:
 
                     detection_payload = [self._serialize_detection(det) for det in detections]
                     entities, track_payload = self._serialize_tracks_payload(tracks)
+
+                    if self._annotated_frame_buffer is not None:
+                        track_bboxes = [_track_bbox(track) for track in tracks]
+                        annotated = frame.copy()
+                        self._draw_annotations(annotated, detections, tracks, track_bboxes)
+                        _, jpeg_array = cv2.imencode(
+                            ".jpg", annotated, [int(cv2.IMWRITE_JPEG_QUALITY), 85],
+                        )
+                        self._annotated_frame_buffer.store(
+                            jpeg_array.tobytes(), packet.frame_index, frame_width, frame_height,
+                        )
 
                     continuity_health = self._estimate_continuity(tracks, process_ts_ms)
                     self._apply_ball_continuity(entities, track_payload, process_ts_ms)

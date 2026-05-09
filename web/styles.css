@@ -682,7 +682,7 @@ body[data-streak-level="3"] .streak-text {
   box-shadow: inset 0 0 0 1px rgba(169, 222, 249, 0.09);
 }
 
-.source-video {
+.annotated-video {
   position: absolute;
   inset: 0;
   z-index: 1;
@@ -691,15 +691,6 @@ body[data-streak-level="3"] .streak-text {
   object-fit: contain;
   display: block;
   background: #050d13;
-}
-
-.overlay-canvas {
-  position: absolute;
-  inset: 0;
-  z-index: 3;
-  width: 100%;
-  height: 100%;
-  pointer-events: none;
 }
 
 .video-hint {

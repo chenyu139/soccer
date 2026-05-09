@@ -1,9 +1,7 @@
 const pitchLength = 105;
 const pitchWidth = 68;
 
-const videoEl = document.getElementById("sourceVideo");
-const overlayCanvas = document.getElementById("overlay");
-const overlayCtx = overlayCanvas.getContext("2d");
+const annotatedImg = document.getElementById("annotatedVideo");
 
 const pitchCanvas = document.getElementById("pitch");
 const pitchCtx = pitchCanvas.getContext("2d");
@@ -22,26 +20,11 @@ let latestDecode = "-";
 let latestDetections = [];
 let latestTracks = [];
 let latestFrame = { width: 0, height: 0, source_ts_ms: null, capture_ts_ms: null };
-let lastVideoSyncAt = 0;
-let lastHardSeekAt = 0;
-let videoRateUntil = 0;
-let lastOverlayRenderAt = 0;
 let lastPitchRenderAt = 0;
 
 const isMobileDevice =
   window.matchMedia("(max-width: 900px)").matches ||
   /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent || "");
-const videoSyncConfig = {
-  minSyncIntervalMs: isMobileDevice ? 620 : 320,
-  softDriftSec: isMobileDevice ? 0.55 : 0.35,
-  hardSeekDriftSec: isMobileDevice ? 2.2 : 1.2,
-  hardSeekCooldownMs: isMobileDevice ? 3000 : 1800,
-  rateGain: isMobileDevice ? 0.09 : 0.12,
-  maxRateDelta: isMobileDevice ? 0.06 : 0.1,
-  minRate: isMobileDevice ? 0.94 : 0.9,
-  maxRate: isMobileDevice ? 1.06 : 1.1,
-  rateHoldMs: isMobileDevice ? 900 : 600,
-};
 
 const defaultPitchCamera = Object.freeze({
   yaw: -34,
@@ -147,11 +130,6 @@ const skillCatalog = new Map(defaultSkillCatalog.map((item) => [item.name, item]
 const seenEventIds = new Set();
 const seenSkillIds = new Set();
 const eventTimeline = [];
-const overlayFrameBuffer = [];
-const maxOverlayFrameBuffer = isMobileDevice ? 320 : 260;
-let overlaySyncDeltaMs = 0;
-const maxFutureOverlayLeadMs = isMobileDevice ? 80 : 120;
-
 const localUserId = (() => {
   const key = "soccer_game_user_id";
   try {
@@ -199,65 +177,6 @@ function trimSet(setObj, maxSize) {
     }
     setObj.delete(first);
   }
-}
-
-function resolveFrameSourceTsMs(payload) {
-  const sourceTs = payload && payload.frame ? Number(payload.frame.source_ts_ms) : NaN;
-  return Number.isFinite(sourceTs) && sourceTs > 0 ? sourceTs : null;
-}
-
-function pushOverlaySnapshot(payload) {
-  const sourceTsMs = resolveFrameSourceTsMs(payload);
-  overlayFrameBuffer.push({
-    sourceTsMs,
-    frame: payload.frame || null,
-    detections: Array.isArray(payload.detections) ? payload.detections : [],
-    tracks: Array.isArray(payload.tracks) ? payload.tracks : [],
-  });
-  if (overlayFrameBuffer.length > maxOverlayFrameBuffer) {
-    overlayFrameBuffer.splice(0, overlayFrameBuffer.length - maxOverlayFrameBuffer);
-  }
-}
-
-function pickOverlaySnapshotForVideoTime() {
-  if (overlayFrameBuffer.length === 0) {
-    overlaySyncDeltaMs = 0;
-    return null;
-  }
-  if (!videoEl || !Number.isFinite(videoEl.currentTime) || videoEl.currentTime <= 0) {
-    overlaySyncDeltaMs = 0;
-    return overlayFrameBuffer[overlayFrameBuffer.length - 1];
-  }
-
-  const targetMs = videoEl.currentTime * 1000;
-  let best = null;
-  let bestCost = Number.POSITIVE_INFINITY;
-
-  for (let i = overlayFrameBuffer.length - 1; i >= 0; i -= 1) {
-    const item = overlayFrameBuffer[i];
-    if (!Number.isFinite(item.sourceTsMs)) {
-      continue;
-    }
-    const delta = item.sourceTsMs - targetMs;
-    if (delta > maxFutureOverlayLeadMs) {
-      continue;
-    }
-    const cost = Math.abs(delta) + (delta > 0 ? 240 : 0);
-    if (cost < bestCost) {
-      best = item;
-      bestCost = cost;
-      overlaySyncDeltaMs = Math.round(delta);
-    }
-    if (delta < -2200 && best !== null) {
-      break;
-    }
-  }
-
-  if (best === null) {
-    overlaySyncDeltaMs = 0;
-    return overlayFrameBuffer[overlayFrameBuffer.length - 1];
-  }
-  return best;
 }
 
 function pushEventLine(text, kind = "event") {
@@ -330,7 +249,6 @@ function refreshMetaBar(continuity) {
       <span>backend: ${latestBackend}</span>
       <span>process: ${latestProcess} ms</span>
       <span>decode: ${latestDecode}</span>
-      <span>overlay_sync: ${overlaySyncDeltaMs} ms</span>
       <span>continuity: ${continuity.health} gap=${continuity.gap_ms}ms</span>
     `;
 }
@@ -477,12 +395,10 @@ async function loadVideoPreview() {
       throw new Error(`health status ${res.status}`);
     }
     const health = await res.json();
-    const previewUrl = String(health.video_preview_url || "");
-    if (previewUrl) {
-      videoEl.src = previewUrl;
-      videoEl.playbackRate = 1.0;
+    const mjpegUrl = String(health.annotated_mjpeg_url || "/api/video/annotated");
+    if (mjpegUrl) {
+      annotatedImg.src = mjpegUrl;
       videoHintEl.style.display = "none";
-      videoEl.play().catch(() => {});
       return;
     }
   } catch (error) {
@@ -490,7 +406,7 @@ async function loadVideoPreview() {
   }
 
   videoHintEl.style.display = "flex";
-  videoHintEl.textContent = "当前数据源不是本地视频文件，页面仅显示映射与跟踪数据。";
+  videoHintEl.textContent = "视频流暂不可用。";
 }
 
 function ingestGameEvents(items) {
@@ -853,8 +769,6 @@ function connect() {
       latestFrame && Number.isFinite(latestFrame.source_ts_ms)
         ? Math.max(0, Date.now() - Number(latestFrame.source_ts_ms))
         : 0;
-    pushOverlaySnapshot(data);
-    syncVideoTimeToFrame(latestFrame);
 
     const now = performance.now();
     const payloadEntities = Array.isArray(data.entities) ? data.entities : [];
@@ -864,72 +778,6 @@ function connect() {
     applyGameSnapshot(data);
     refreshMetaBar(gameView.continuity || {});
   });
-}
-
-function syncVideoTimeToFrame(frameInfo) {
-  if (!frameInfo || frameInfo.source_ts_ms == null) {
-    return;
-  }
-  if (!videoEl || Number.isNaN(videoEl.duration) || !Number.isFinite(videoEl.duration) || videoEl.duration <= 0) {
-    return;
-  }
-  const now = performance.now();
-  if (now - lastVideoSyncAt < videoSyncConfig.minSyncIntervalMs) {
-    return;
-  }
-  lastVideoSyncAt = now;
-
-  const targetSeconds = Math.max(0, frameInfo.source_ts_ms / 1000);
-  const safeTarget = Math.min(Math.max(0, videoEl.duration - 0.05), targetSeconds);
-  const signedDrift = safeTarget - videoEl.currentTime;
-  const driftAbs = Math.abs(signedDrift);
-
-  if (driftAbs >= videoSyncConfig.hardSeekDriftSec) {
-    if (now - lastHardSeekAt >= videoSyncConfig.hardSeekCooldownMs) {
-      videoEl.currentTime = safeTarget;
-      videoEl.playbackRate = 1.0;
-      videoRateUntil = 0;
-      lastHardSeekAt = now;
-    }
-    return;
-  }
-
-  if (driftAbs >= videoSyncConfig.softDriftSec) {
-    const rateAdjust = clamp(
-      signedDrift * videoSyncConfig.rateGain,
-      -videoSyncConfig.maxRateDelta,
-      videoSyncConfig.maxRateDelta
-    );
-    const nextRate = clamp(1.0 + rateAdjust, videoSyncConfig.minRate, videoSyncConfig.maxRate);
-    if (Math.abs((videoEl.playbackRate || 1.0) - nextRate) > 0.01) {
-      videoEl.playbackRate = nextRate;
-    }
-    videoRateUntil = now + videoSyncConfig.rateHoldMs;
-    return;
-  }
-
-  if (videoRateUntil > 0 && now >= videoRateUntil) {
-    if (Math.abs((videoEl.playbackRate || 1.0) - 1.0) > 0.01) {
-      videoEl.playbackRate = 1.0;
-    }
-    videoRateUntil = 0;
-  }
-}
-
-function syncOverlayCanvas() {
-  const rect = overlayCanvas.getBoundingClientRect();
-  const dpr = window.devicePixelRatio || 1;
-  const w = Math.max(1, Math.round(rect.width));
-  const h = Math.max(1, Math.round(rect.height));
-  const targetW = Math.round(w * dpr);
-  const targetH = Math.round(h * dpr);
-
-  if (overlayCanvas.width !== targetW || overlayCanvas.height !== targetH) {
-    overlayCanvas.width = targetW;
-    overlayCanvas.height = targetH;
-    overlayCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  }
-  return { width: w, height: h };
 }
 
 function syncPitchCanvas() {
@@ -1217,60 +1065,6 @@ function teamColor(team) {
     return "#49a1ff";
   }
   return "#f5f7fa";
-}
-
-function drawVideoOverlay() {
-  const { width: canvasW, height: canvasH } = syncOverlayCanvas();
-  overlayCtx.clearRect(0, 0, canvasW, canvasH);
-
-  const synced = pickOverlaySnapshotForVideoTime();
-  const drawFrame = (synced && synced.frame) || latestFrame;
-  const detections = (synced && synced.detections) || latestDetections;
-  const tracks = (synced && synced.tracks) || latestTracks;
-
-  const frameW = drawFrame.width || videoEl.videoWidth || 1;
-  const frameH = drawFrame.height || videoEl.videoHeight || 1;
-  const sx = canvasW / frameW;
-  const sy = canvasH / frameH;
-
-  overlayCtx.setLineDash([6, 4]);
-  overlayCtx.lineWidth = 1.5;
-  overlayCtx.strokeStyle = "rgba(255, 224, 87, 0.9)";
-  for (const det of detections) {
-    const x = det.x * sx;
-    const y = det.y * sy;
-    const w = det.w * sx;
-    const h = det.h * sy;
-    overlayCtx.strokeRect(x, y, w, h);
-  }
-
-  overlayCtx.setLineDash([]);
-  overlayCtx.font = "12px sans-serif";
-  overlayCtx.textBaseline = "top";
-  for (const track of tracks) {
-    const x = track.x * sx;
-    const y = track.y * sy;
-    const w = track.w * sx;
-    const h = track.h * sy;
-    const color = teamColor(track.team);
-
-    overlayCtx.strokeStyle = color;
-    overlayCtx.lineWidth = 2.4;
-    overlayCtx.strokeRect(x, y, w, h);
-
-    if (isMobileDevice && track.type !== "ball") {
-      continue;
-    }
-
-    const label = `${track.id} ${track.type} ${(track.conf * 100).toFixed(0)}%`;
-    const textWidth = overlayCtx.measureText(label).width;
-    const textX = Math.max(0, x);
-    const textY = Math.max(0, y - 18);
-    overlayCtx.fillStyle = "rgba(15, 18, 20, 0.78)";
-    overlayCtx.fillRect(textX, textY, textWidth + 8, 16);
-    overlayCtx.fillStyle = "#ffffff";
-    overlayCtx.fillText(label, textX + 4, textY + 2);
-  }
 }
 
 function drawWorldLine(a, b, stroke, width, camera) {
@@ -1694,13 +1488,7 @@ function drawPitchScene() {
 }
 
 function render(now = performance.now()) {
-  const overlayIntervalMs = 33;
   const pitchIntervalMs = isMobileDevice ? 42 : 28;
-
-  if (now - lastOverlayRenderAt >= overlayIntervalMs) {
-    drawVideoOverlay();
-    lastOverlayRenderAt = now;
-  }
 
   if (now - lastPitchRenderAt >= pitchIntervalMs) {
     drawPitchScene();

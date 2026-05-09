@@ -5,7 +5,7 @@ import asyncio
 import logging
 import os
 import uuid
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, TypeVar
@@ -13,10 +13,11 @@ from typing import Any, TypeVar
 import uvicorn
 import yaml
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from .frame_buffer import AnnotatedFrameBuffer
 from .game_engine import GameEngine
 from .pipeline import SCHEMA_VERSION, StreamProcessor
 from .runtime import (
@@ -185,6 +186,7 @@ def _runtime_snapshot(
         "reid_max_inactive_tracks": runtime_settings.reid_max_inactive_tracks,
         "record_path": runtime_settings.record_path,
         "video_preview_url": preview_url,
+        "annotated_mjpeg_url": "/api/video/annotated",
         "ws_schema_version": SCHEMA_VERSION,
         "game_mode": "realtime-command-battle",
     }
@@ -201,6 +203,7 @@ def create_app(video_source: str, target_fps: int, runtime_settings: RuntimeSett
         queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=5)
         hub = ConnectionHub()
         game_engine = GameEngine()
+        annotated_buffer = AnnotatedFrameBuffer()
 
         detector = build_detector(runtime_settings)
         tracker = build_tracker(runtime_settings)
@@ -221,6 +224,7 @@ def create_app(video_source: str, target_fps: int, runtime_settings: RuntimeSett
             recorder=recorder,
             game_engine=game_engine,
             prefer_latest_frame=runtime_settings.prefer_latest_frame,
+            annotated_frame_buffer=annotated_buffer,
         )
 
         producer_task = asyncio.create_task(processor.run(queue), name="stream-processor")
@@ -230,6 +234,7 @@ def create_app(video_source: str, target_fps: int, runtime_settings: RuntimeSett
         app.state.hub = hub
         app.state.game_engine = game_engine
         app.state.processor = processor
+        app.state.annotated_buffer = annotated_buffer
         app.state.runtime = _runtime_snapshot(runtime_settings, detector, tracker, projector, local_video_file)
 
         try:
@@ -263,6 +268,41 @@ def create_app(video_source: str, target_fps: int, runtime_settings: RuntimeSett
         if local_video_file is None:
             raise HTTPException(status_code=404, detail="Current source is not a local video file.")
         return FileResponse(local_video_file)
+
+    @app.get("/api/video/annotated")
+    async def annotated_mjpeg() -> StreamingResponse:
+        buffer: AnnotatedFrameBuffer = app.state.annotated_buffer
+        boundary = "frame"
+
+        async def generate() -> AsyncIterator[bytes]:
+            frame_interval = 1.0 / max(1, target_fps)
+            last_yield = 0.0
+            while True:
+                jpeg_bytes = await buffer.wait_for_frame(timeout_s=2.0)
+                if jpeg_bytes is None:
+                    continue
+                now = asyncio.get_event_loop().time()
+                elapsed = now - last_yield
+                if last_yield > 0.0 and elapsed < frame_interval:
+                    await asyncio.sleep(frame_interval - elapsed)
+                last_yield = asyncio.get_event_loop().time()
+                header = (
+                    f"--{boundary}\r\n"
+                    "Content-Type: image/jpeg\r\n"
+                    f"Content-Length: {len(jpeg_bytes)}\r\n"
+                    "\r\n"
+                ).encode("ascii")
+                yield header + jpeg_bytes + b"\r\n"
+
+        return StreamingResponse(
+            generate(),
+            media_type="multipart/x-mixed-replace; boundary=frame",
+            headers={
+                "Cache-Control": "no-cache, no-store, must-revalidate",
+                "Pragma": "no-cache",
+                "Expires": "0",
+            },
+        )
 
     @app.post("/api/game/join")
     async def game_join(request: JoinGameRequest) -> dict[str, Any]:
