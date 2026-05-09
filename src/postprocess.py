@@ -23,7 +23,7 @@ class PostprocessConfig:
     player_prediction_damping: float = 0.78
     ball_confidence_decay: float = 0.97
     player_confidence_decay: float = 0.93
-    team_vote_window: int = 12
+    team_vote_window: int = 30
 
 
 class TrackPostProcessor:

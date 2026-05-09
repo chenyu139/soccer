@@ -359,7 +359,15 @@ def _extract_jersey_feature(
     h: int,
     saturation_threshold: int = 45,
 ) -> np.ndarray | None:
-    """Extract a compact HSV feature vector from the jersey region of a bounding box."""
+    """Extract a 3D jersey feature: [colored_ratio, colored_hue_norm, white_ratio].
+
+    colored_ratio: fraction of pixels with saturation above threshold (0 for white, ~0.5 for colored)
+    colored_hue_norm: median hue of colored pixels normalized to [0,1]; 0.5 (neutral) if none
+    white_ratio: fraction of pixels that are white (low-sat, high-val)
+
+    This feature separates any two jersey color combinations regardless of whether one
+    team wears an achromatic (white/dark) jersey.
+    """
     top = y
     bottom = y + max(1, h // 2)
     roi = hsv_frame[top:bottom, x : x + w]
@@ -369,16 +377,16 @@ def _extract_jersey_feature(
     hue = roi[:, :, 0].astype(np.float32)
     sat = roi[:, :, 1].astype(np.float32)
     val = roi[:, :, 2].astype(np.float32)
-    valid = sat > saturation_threshold
-    if np.any(valid):
-        return np.array(
-            [float(np.median(hue[valid])), float(np.median(sat[valid])), float(np.median(val[valid]))],
-            dtype=np.float32,
-        )
-    return np.array(
-        [0.0, 0.0, float(np.median(val))],
-        dtype=np.float32,
-    )
+    total = float(max(1, hue.size))
+
+    colored_mask = sat > saturation_threshold
+    white_mask = (sat <= 45) & (val >= 150)
+
+    colored_ratio = float(np.sum(colored_mask)) / total
+    white_ratio = float(np.sum(white_mask)) / total
+    colored_hue_norm = float(np.median(hue[colored_mask])) / 179.0 if np.any(colored_mask) else 0.5
+
+    return np.array([colored_ratio, colored_hue_norm, white_ratio], dtype=np.float32)
 
 
 class YoloDetector:
@@ -408,7 +416,7 @@ class YoloDetector:
         self.team_config = team_config or TeamClassifierConfig()
         self.allowed_kinds = {str(kind).strip().lower() for kind in (allowed_kinds or ()) if str(kind).strip()}
         self.ball_config = ball_config or BallDetectionConfig()
-        self._anchor_hues: tuple[float, float] | None = None  # (hue_A, hue_B) EMA anchors for stable team assignment
+        self._anchor_centers: tuple[np.ndarray, np.ndarray] | None = None  # (center_A, center_B) in scaled feature space
         self.backend = self._resolve_backend(model_path=model_path, backend=backend)
         self.runner = self._build_runner(
             model_path=model_path,
@@ -441,8 +449,20 @@ class YoloDetector:
                 self._cluster_teams(frame, dets)
         return all_dets
 
+    # Weights: colored_ratio, colored_hue_norm, white_ratio — all in [0,1] range
+    _FEAT_WEIGHTS = np.array([1.5, 0.5, 1.5], dtype=np.float32)
+
     def _cluster_teams(self, frame: np.ndarray, detections: list[Detection]) -> None:
-        """Re-assign teams by K-means clustering on jersey color features."""
+        """Assign team labels per player using stable anchor centers in feature space.
+
+        K-means runs once to initialize team color anchors. All subsequent frames
+        classify each player individually by nearest anchor — no per-frame clustering.
+
+        Feature: [colored_ratio, colored_hue_norm, white_ratio]
+          colored_ratio  ≈ 0   for white/achromatic, ≈ 0.5+ for colored jerseys
+          colored_hue    ≈ 0   for red, ≈ 0.5 for neutral, ≈ 0.64 for blue
+          white_ratio    ≈ 0.7 for white jerseys, ≈ 0 for colored jerseys
+        """
         players = [(i, d) for i, d in enumerate(detections) if d.kind == "player"]
         if len(players) < 2:
             return
@@ -460,47 +480,49 @@ class YoloDetector:
             return
 
         data = np.stack([f for _, f in features], axis=0)
-        weights = np.array([2.0, 0.5, 0.3], dtype=np.float32).reshape(1, 3)
-        scaled = np.concatenate([data[:, 0:1] * weights[0, 0], data[:, 1:2] * weights[0, 1], data[:, 2:3] * weights[0, 2]], axis=1)
+        scaled = (data * self._FEAT_WEIGHTS).astype(np.float32)
 
-        criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 10, 1.0)
-        _, labels, _centers = cv2.kmeans(
-            scaled.astype(np.float32), 2, None, criteria, 3, cv2.KMEANS_PP_CENTERS,
-        )
+        if self._anchor_centers is None:
+            criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 20, 0.5)
+            _, labels, centers = cv2.kmeans(scaled, 2, None, criteria, 5, cv2.KMEANS_PP_CENTERS)
+            labels_flat = labels.flatten()
 
-        cluster_hues: dict[int, float] = {}
-        for cluster_id in range(2):
-            mask = labels.flatten() == cluster_id
-            if np.any(mask):
-                cluster_hues[cluster_id] = float(np.mean(data[mask, 0]))
-
-        if len(cluster_hues) < 2:
-            return
-
-        sorted_clusters = sorted(cluster_hues.items(), key=lambda x: x[1])
-        h_low = cluster_hues[sorted_clusters[0][0]]
-        h_high = cluster_hues[sorted_clusters[1][0]]
-
-        if self._anchor_hues is None:
-            self._anchor_hues = (h_low, h_high)
-            label_map = {sorted_clusters[0][0]: "A", sorted_clusters[1][0]: "B"}
-            logger.debug("team anchor init: A_hue=%.1f B_hue=%.1f", h_low, h_high)
-        else:
-            anchor_a, anchor_b = self._anchor_hues
-            dist_normal = abs(h_low - anchor_a) + abs(h_high - anchor_b)
-            dist_flipped = abs(h_low - anchor_b) + abs(h_high - anchor_a)
-            if dist_flipped < dist_normal:
-                label_map = {sorted_clusters[0][0]: "B", sorted_clusters[1][0]: "A"}
-                new_a, new_b = h_high, h_low
+            # Cluster A/B assignment:
+            # 1. If clusters differ significantly in colored_ratio → achromatic (white) → A, colored → B
+            # 2. Otherwise both are chromatic → lower hue → A (warmer), higher hue → B (cooler)
+            cr_0 = float(np.mean(data[labels_flat == 0, 0]))  # colored_ratio of cluster 0
+            cr_1 = float(np.mean(data[labels_flat == 1, 0]))  # colored_ratio of cluster 1
+            if abs(cr_0 - cr_1) > 0.15:
+                # One achromatic (white/dark) team: lower colored_ratio → A
+                if cr_0 <= cr_1:
+                    center_a, center_b = centers[0].copy(), centers[1].copy()
+                else:
+                    center_a, center_b = centers[1].copy(), centers[0].copy()
+                logger.debug(
+                    "team anchors (achromatic vs colored): A_colored=%.2f B_colored=%.2f",
+                    min(cr_0, cr_1), max(cr_0, cr_1),
+                )
             else:
-                label_map = {sorted_clusters[0][0]: "A", sorted_clusters[1][0]: "B"}
-                new_a, new_b = h_low, h_high
-            alpha = 0.1
-            self._anchor_hues = (alpha * new_a + (1 - alpha) * anchor_a, alpha * new_b + (1 - alpha) * anchor_b)
+                # Both chromatic: lower hue → A (warmer/red), higher hue → B (cooler/blue)
+                h_0 = float(np.mean(data[labels_flat == 0, 1]))
+                h_1 = float(np.mean(data[labels_flat == 1, 1]))
+                if h_0 <= h_1:
+                    center_a, center_b = centers[0].copy(), centers[1].copy()
+                else:
+                    center_a, center_b = centers[1].copy(), centers[0].copy()
+                logger.debug(
+                    "team anchors (hue-based): A_hue_norm=%.2f B_hue_norm=%.2f",
+                    min(h_0, h_1), max(h_0, h_1),
+                )
 
-        for (orig_idx, _feat), label_arr in zip(features, labels):
-            cluster_id = int(label_arr[0])
-            detections[orig_idx].team = label_map.get(cluster_id, "unknown")
+            self._anchor_centers = (center_a, center_b)
+
+        center_a, center_b = self._anchor_centers
+        for orig_idx, feat in features:
+            s = (feat * self._FEAT_WEIGHTS).astype(np.float32)
+            d_a = float(np.linalg.norm(s - center_a))
+            d_b = float(np.linalg.norm(s - center_b))
+            detections[orig_idx].team = "A" if d_a <= d_b else "B"
 
     def _build_detections(
         self,
