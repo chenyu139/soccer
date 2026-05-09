@@ -683,13 +683,9 @@ body[data-streak-level="3"] .streak-text {
 }
 
 .annotated-video {
-  position: absolute;
-  inset: 0;
-  z-index: 1;
-  width: 100%;
-  height: 100%;
-  object-fit: contain;
   display: block;
+  width: 100%;
+  aspect-ratio: 16 / 9;
   background: #050d13;
 }
 

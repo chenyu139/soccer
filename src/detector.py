@@ -351,6 +351,36 @@ def infer_team_from_bbox(
     return "unknown"
 
 
+def _extract_jersey_feature(
+    hsv_frame: np.ndarray,
+    x: int,
+    y: int,
+    w: int,
+    h: int,
+    saturation_threshold: int = 45,
+) -> np.ndarray | None:
+    """Extract a compact HSV feature vector from the jersey region of a bounding box."""
+    top = y
+    bottom = y + max(1, h // 2)
+    roi = hsv_frame[top:bottom, x : x + w]
+    if roi.size == 0:
+        return None
+
+    hue = roi[:, :, 0].astype(np.float32)
+    sat = roi[:, :, 1].astype(np.float32)
+    val = roi[:, :, 2].astype(np.float32)
+    valid = sat > saturation_threshold
+    if np.any(valid):
+        return np.array(
+            [float(np.median(hue[valid])), float(np.median(sat[valid])), float(np.median(val[valid]))],
+            dtype=np.float32,
+        )
+    return np.array(
+        [0.0, 0.0, float(np.median(val))],
+        dtype=np.float32,
+    )
+
+
 class YoloDetector:
     """YOLO detector for mainstream production-grade object detection."""
 
@@ -378,6 +408,7 @@ class YoloDetector:
         self.team_config = team_config or TeamClassifierConfig()
         self.allowed_kinds = {str(kind).strip().lower() for kind in (allowed_kinds or ()) if str(kind).strip()}
         self.ball_config = ball_config or BallDetectionConfig()
+        self._anchor_hues: tuple[float, float] | None = None  # (hue_A, hue_B) EMA anchors for stable team assignment
         self.backend = self._resolve_backend(model_path=model_path, backend=backend)
         self.runner = self._build_runner(
             model_path=model_path,
@@ -404,7 +435,72 @@ class YoloDetector:
             return []
 
         predictions = self.runner.predict(frames)
-        return [self._build_detections(frame, xyxy, conf, cls) for frame, (xyxy, conf, cls) in zip(frames, predictions)]
+        all_dets = [self._build_detections(frame, xyxy, conf, cls) for frame, (xyxy, conf, cls) in zip(frames, predictions)]
+        if self.team_config.mode == "auto":
+            for frame, dets in zip(frames, all_dets):
+                self._cluster_teams(frame, dets)
+        return all_dets
+
+    def _cluster_teams(self, frame: np.ndarray, detections: list[Detection]) -> None:
+        """Re-assign teams by K-means clustering on jersey color features."""
+        players = [(i, d) for i, d in enumerate(detections) if d.kind == "player"]
+        if len(players) < 2:
+            return
+
+        hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        features: list[tuple[int, np.ndarray]] = []
+        for idx, det in players:
+            feat = _extract_jersey_feature(
+                hsv_frame, det.x, det.y, det.w, det.h, self.team_config.saturation_threshold,
+            )
+            if feat is not None:
+                features.append((idx, feat))
+
+        if len(features) < 2:
+            return
+
+        data = np.stack([f for _, f in features], axis=0)
+        weights = np.array([2.0, 0.5, 0.3], dtype=np.float32).reshape(1, 3)
+        scaled = np.concatenate([data[:, 0:1] * weights[0, 0], data[:, 1:2] * weights[0, 1], data[:, 2:3] * weights[0, 2]], axis=1)
+
+        criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 10, 1.0)
+        _, labels, _centers = cv2.kmeans(
+            scaled.astype(np.float32), 2, None, criteria, 3, cv2.KMEANS_PP_CENTERS,
+        )
+
+        cluster_hues: dict[int, float] = {}
+        for cluster_id in range(2):
+            mask = labels.flatten() == cluster_id
+            if np.any(mask):
+                cluster_hues[cluster_id] = float(np.mean(data[mask, 0]))
+
+        if len(cluster_hues) < 2:
+            return
+
+        sorted_clusters = sorted(cluster_hues.items(), key=lambda x: x[1])
+        h_low = cluster_hues[sorted_clusters[0][0]]
+        h_high = cluster_hues[sorted_clusters[1][0]]
+
+        if self._anchor_hues is None:
+            self._anchor_hues = (h_low, h_high)
+            label_map = {sorted_clusters[0][0]: "A", sorted_clusters[1][0]: "B"}
+            logger.debug("team anchor init: A_hue=%.1f B_hue=%.1f", h_low, h_high)
+        else:
+            anchor_a, anchor_b = self._anchor_hues
+            dist_normal = abs(h_low - anchor_a) + abs(h_high - anchor_b)
+            dist_flipped = abs(h_low - anchor_b) + abs(h_high - anchor_a)
+            if dist_flipped < dist_normal:
+                label_map = {sorted_clusters[0][0]: "B", sorted_clusters[1][0]: "A"}
+                new_a, new_b = h_high, h_low
+            else:
+                label_map = {sorted_clusters[0][0]: "A", sorted_clusters[1][0]: "B"}
+                new_a, new_b = h_low, h_high
+            alpha = 0.1
+            self._anchor_hues = (alpha * new_a + (1 - alpha) * anchor_a, alpha * new_b + (1 - alpha) * anchor_b)
+
+        for (orig_idx, _feat), label_arr in zip(features, labels):
+            cluster_id = int(label_arr[0])
+            detections[orig_idx].team = label_map.get(cluster_id, "unknown")
 
     def _build_detections(
         self,

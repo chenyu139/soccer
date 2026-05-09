@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from dataclasses import dataclass
 
 import numpy as np
@@ -23,6 +23,7 @@ class PostprocessConfig:
     player_prediction_damping: float = 0.78
     ball_confidence_decay: float = 0.97
     player_confidence_decay: float = 0.93
+    team_vote_window: int = 12
 
 
 class TrackPostProcessor:
@@ -34,6 +35,7 @@ class TrackPostProcessor:
         self._raw_to_stable: dict[int, int] = {}
         self._stable_state: dict[int, TrackState] = {}
         self._inactive: OrderedDict[int, TrackState] = OrderedDict()
+        self._team_votes: dict[int, deque[str]] = {}
 
     def update(self, tracks: list[TrackState], ts_ms: int) -> list[TrackState]:
         """Smooth active tracks and optionally reconnect short-lived ID breaks."""
@@ -54,6 +56,23 @@ class TrackPostProcessor:
         for observed in tracks:
             stable_id = self._resolve_stable_id(observed, ts_ms)
             smoothed = self._smooth(stable_id, observed, ts_ms)
+            voted_team = self._vote_team(stable_id, smoothed.team)
+            smoothed = TrackState(
+                track_id=smoothed.track_id,
+                kind=smoothed.kind,
+                team=voted_team,
+                x_px=smoothed.x_px,
+                y_px=smoothed.y_px,
+                vx_px=smoothed.vx_px,
+                vy_px=smoothed.vy_px,
+                confidence=smoothed.confidence,
+                last_ts_ms=smoothed.last_ts_ms,
+                bbox_x=smoothed.bbox_x,
+                bbox_y=smoothed.bbox_y,
+                bbox_w=smoothed.bbox_w,
+                bbox_h=smoothed.bbox_h,
+                missed_frames=smoothed.missed_frames,
+            )
             self._stable_state[stable_id] = smoothed
             outputs.append(smoothed)
 
@@ -269,6 +288,19 @@ class TrackPostProcessor:
         if previous is None:
             return current
         return alpha * current + (1.0 - alpha) * previous
+
+    def _vote_team(self, stable_id: int, observed_team: str) -> str:
+        window = max(1, int(self.config.team_vote_window))
+        history = self._team_votes.setdefault(stable_id, deque(maxlen=window))
+        if observed_team not in ("", "unknown"):
+            history.append(observed_team)
+        if not history:
+            return observed_team
+        a_votes = sum(1 for t in history if t == "A")
+        b_votes = sum(1 for t in history if t == "B")
+        if a_votes == b_votes:
+            return history[-1]
+        return "A" if a_votes > b_votes else "B"
 
     def _purge_inactive(self, ts_ms: int) -> None:
         to_remove = [

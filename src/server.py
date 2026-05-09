@@ -278,14 +278,15 @@ def create_app(video_source: str, target_fps: int, runtime_settings: RuntimeSett
             frame_interval = 1.0 / max(1, target_fps)
             last_yield = 0.0
             while True:
-                jpeg_bytes = await buffer.wait_for_frame(timeout_s=2.0)
-                if jpeg_bytes is None:
-                    continue
                 now = asyncio.get_event_loop().time()
-                elapsed = now - last_yield
-                if last_yield > 0.0 and elapsed < frame_interval:
-                    await asyncio.sleep(frame_interval - elapsed)
+                if last_yield > 0.0:
+                    wait = frame_interval - (now - last_yield)
+                    if wait > 0:
+                        await asyncio.sleep(wait)
                 last_yield = asyncio.get_event_loop().time()
+                jpeg_bytes = buffer.latest
+                if not jpeg_bytes:
+                    continue
                 header = (
                     f"--{boundary}\r\n"
                     "Content-Type: image/jpeg\r\n"

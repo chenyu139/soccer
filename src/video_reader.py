@@ -167,7 +167,7 @@ class BufferedVideoReader:
 
                 frame_idx += 1
                 ts_pos = capture.get(cv2.CAP_PROP_POS_MSEC)
-                source_ts_ms = int(ts_pos) if ts_pos > 0 else None
+                source_ts_ms = int(ts_pos) if ts_pos >= 0 else None
                 if source_is_file and source_ts_ms is not None:
                     loop_start_wall, loop_start_source_ms = self._pace_local_file(
                         source_ts_ms,
@@ -269,7 +269,7 @@ class BufferedVideoReader:
         loop_start_wall: float | None,
         loop_start_source_ms: int | None,
     ) -> tuple[float, int]:
-        if loop_start_source_ms is None or loop_start_wall is None or source_ts_ms < loop_start_source_ms:
+        if loop_start_source_ms is None or loop_start_wall is None or source_ts_ms <= loop_start_source_ms:
             return (time.perf_counter(), source_ts_ms)
 
         expected_elapsed_s = max(0.0, (source_ts_ms - loop_start_source_ms) / 1000.0)
